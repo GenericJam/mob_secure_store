@@ -44,7 +44,7 @@ defmodule MobSecureStore do
   @doc "The value at `key`, or `:error` when there is none."
   @callback get(key :: String.t()) :: {:ok, binary()} | :error | {:error, reason()}
 
-  @doc "Upserts `key`, durably: `:ok` means written, not queued."
+  @doc "Upserts `key`: `:ok` means written, not queued (see each backend for what survives a power cut)."
   @callback put(key :: String.t(), value :: binary()) :: :ok | {:error, reason()}
 
   @doc "Removes `key`; removing an absent key is `:ok`."
@@ -114,8 +114,8 @@ defmodule MobSecureStore do
   def backend_for(:phone, false), do: MobSecureStore.Unavailable
   def backend_for(:host, false), do: MobSecureStore.File
 
-  # {where, nif_linked?}, asked once: a module whose on_load failed is
-  # retried, and warns, on every call.
+  # {where, nif_linked?}, detected once per VM: whether the NIF is linked
+  # can't change without a native rebuild, which restarts the VM.
   defp environment do
     with :unknown <- :persistent_term.get({__MODULE__, :environment}, :unknown) do
       nif_linked? = :mob_secure_store_nif.available()
