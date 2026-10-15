@@ -23,7 +23,8 @@ defmodule MobSecureStore do
       directory under the app's data dir (`MobSecureStore.File`).
 
   `config :mob_secure_store, :backend, Module` replaces the backend (a module
-  implementing this behaviour), e.g. a fake in a host app's tests.
+  implementing this behaviour), e.g. a fake in a host app's tests. On a phone
+  `MobSecureStore.File` is refused even when configured.
 
   Keys are non-empty UTF-8 strings; values are any binary. A key or value of
   another shape raises `ArgumentError`.
@@ -34,6 +35,7 @@ defmodule MobSecureStore do
   @typedoc "Why the store couldn't do what was asked."
   @type reason ::
           :secure_store_unavailable
+          | :no_data
           | {:sec, integer()}
           | {:jni, atom()}
           | File.posix()
@@ -80,49 +82,69 @@ defmodule MobSecureStore do
   end
 
   @doc """
-  The backend in effect: the configured one, else the one for this platform
-  (detected once per VM).
+  The backend in effect: the configured one, else the one for where the code
+  runs (detected once per VM). On a phone a configured `MobSecureStore.File`
+  is refused: the backend is then `MobSecureStore.Unavailable`.
   """
   @spec backend() :: module()
   def backend do
+    {where, nif_linked?} = environment()
+
     case Application.fetch_env(:mob_secure_store, :backend) do
-      {:ok, module} -> module
-      :error -> detected_backend()
+      {:ok, MobSecureStore.File} when where == :phone ->
+        Logger.error(
+          "[mob_secure_store] refusing the configured file backend on a phone: secrets can't be kept"
+        )
+
+        MobSecureStore.Unavailable
+
+      {:ok, module} ->
+        module
+
+      :error ->
+        backend_for(where, nif_linked?)
     end
   end
 
   @doc false
-  # The backend for `platform`, given whether the NIF is linked into the app.
-  @spec backend_for(:android | :ios | :host, boolean()) :: module()
-  def backend_for(:host, _nif_linked?), do: MobSecureStore.File
-  def backend_for(_phone, true), do: MobSecureStore.Native
-  def backend_for(_phone, false), do: MobSecureStore.Unavailable
+  # The backend for where the code runs, given whether the NIF is linked into
+  # the app (it only ever is on a phone).
+  @spec backend_for(:phone | :host, boolean()) :: module()
+  def backend_for(_where, true), do: MobSecureStore.Native
+  def backend_for(:phone, false), do: MobSecureStore.Unavailable
+  def backend_for(:host, false), do: MobSecureStore.File
 
-  defp detected_backend do
-    with :unknown <- :persistent_term.get({__MODULE__, :backend}, :unknown) do
-      platform = platform()
-      module = backend_for(platform, platform != :host and :mob_secure_store_nif.available())
+  # {where, nif_linked?}, asked once: a module whose on_load failed is
+  # retried, and warns, on every call.
+  defp environment do
+    with :unknown <- :persistent_term.get({__MODULE__, :environment}, :unknown) do
+      nif_linked? = :mob_secure_store_nif.available()
+      where = if phone?(), do: :phone, else: :host
 
-      if module == MobSecureStore.Unavailable,
+      if where == :phone and not nif_linked?,
         do:
           Logger.error(
             "[mob_secure_store] the app was built without the secure store NIF: " <>
               "secrets can't be kept until it's rebuilt (mix mob.deploy --native)"
           )
 
-      :persistent_term.put({__MODULE__, :backend}, module)
-      module
+      environment = {where, nif_linked?}
+      :persistent_term.put({__MODULE__, :environment}, environment)
+      environment
     end
   end
 
-  # mob core's NIF says which phone this is; off the phone it isn't loaded.
-  defp platform do
-    case :mob_nif.platform() do
-      platform when platform in [:android, :ios] -> platform
-      _ -> :host
-    end
+  # Anything that looks like a phone counts as one, so that a broken mob core
+  # NIF can't make a phone fall back to plain files: mob's device launcher
+  # sets MOB_BEAMS_DIR, and mob core's NIF names the platform.
+  defp phone? do
+    System.get_env("MOB_BEAMS_DIR") != nil or mob_platform() in [:android, :ios]
+  end
+
+  defp mob_platform do
+    :mob_nif.platform()
   rescue
-    _ in [UndefinedFunctionError, ErlangError] -> :host
+    _ in [UndefinedFunctionError, ErlangError] -> :unknown
   end
 
   defp check_key!(key) do

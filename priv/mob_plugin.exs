@@ -33,7 +33,7 @@
       "set to the bundle id; not named *.entitlements, which device signing would pick up) and, " <>
       "in ios/build.zig's addLink, pass it before \"-o\": " <>
       ~S|run.addArgs(&.{ "-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__entitlements", "-Xlinker" }); | <>
-      "run.addFileArg(<that plist>);. Device builds need nothing: mob_dev signs them with the " <>
+      "run.addFileArg(<that plist>). Device builds need nothing: mob_dev signs them with the " <>
       "provisioning profile's entitlements. See the README."
   ]
 }

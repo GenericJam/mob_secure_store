@@ -4,12 +4,14 @@ defmodule MobSecureStore.Native do
   the native build. EncryptedSharedPreferences under an Android Keystore
   master key on Android, the Keychain on iOS.
 
-  Errors are `{:error, {:sec, os_status}}` from Security.framework on iOS and
-  `{:error, {:jni, reason}}` on Android, where reason is `:no_jenv`,
-  `:bridge_not_registered` (the bridge's `register()` didn't run before the
-  BEAM started), `:alloc`, `:call_failed` (the bridge threw, e.g. the
-  encrypted preferences couldn't be opened; it logs why under the
-  `MobSecureStore` logcat tag) or `:commit_failed`.
+  Errors on iOS are `{:error, {:sec, os_status}}` from Security.framework, or
+  `{:error, :no_data}` when the Keychain reported success without returning
+  the value. On Android they are `{:error, {:jni, reason}}`, where reason is
+  `:no_jenv`, `:bridge_not_registered` (the bridge's `register()` didn't run
+  before the BEAM started), `:too_large` (over 2 GiB), `:alloc`,
+  `:call_failed` (the bridge threw, e.g. the encrypted preferences couldn't
+  be opened; it logs why under the `MobSecureStore` logcat tag) or
+  `:commit_failed`.
   """
   @behaviour MobSecureStore
 

@@ -14,8 +14,9 @@
  *   store_put(Key, Val)  -> ok | {error, {jni, Reason}}
  *   store_delete(Key)    -> ok | {error, {jni, Reason}}   (absent key: ok)
  *
- * Reason: no_jenv | bridge_not_registered | alloc | call_failed (the bridge
- * threw; it logs why under the MobSecureStore tag) | commit_failed.
+ * Reason: no_jenv | bridge_not_registered | too_large (over 2 GiB, a Java
+ * array's limit) | alloc | call_failed (the bridge threw; it logs why under
+ * the MobSecureStore tag) | commit_failed.
  *
  * The bridge class and method IDs are cached by nativeRegister, which the
  * generated MobPluginBootstrap.registerAll calls (via the bridge's register())
@@ -26,6 +27,7 @@
 
 #include <erl_nif.h>
 #include <jni.h>
+#include <stdint.h>
 #include <string.h>
 
 /* mob core exports, linked into the same .so. */
@@ -37,21 +39,29 @@ static jmethodID g_get = NULL;
 static jmethodID g_put = NULL;
 static jmethodID g_delete = NULL;
 
+/* A static method ID, or NULL with the NoSuchMethodError cleared, so no JNI
+ * call runs with an exception pending. */
+static jmethodID mss_method(JNIEnv *jenv, jclass cls, const char *name, const char *sig) {
+    jmethodID id = (*jenv)->GetStaticMethodID(jenv, cls, name, sig);
+    if ((*jenv)->ExceptionCheck(jenv)) {
+        (*jenv)->ExceptionClear(jenv);
+        return NULL;
+    }
+    return id;
+}
+
 JNIEXPORT void JNICALL
 Java_io_mob_securestore_MobSecureStoreBridge_nativeRegister(JNIEnv *jenv, jclass cls) {
     if (g_cls != NULL)
         return;
 
-    jmethodID get = (*jenv)->GetStaticMethodID(jenv, cls, "getBridge", "([B)[B");
-    jmethodID put = (*jenv)->GetStaticMethodID(jenv, cls, "putBridge", "([B[B)Z");
-    jmethodID del = (*jenv)->GetStaticMethodID(jenv, cls, "deleteBridge", "([B)Z");
-    if ((*jenv)->ExceptionCheck(jenv)) {
-        (*jenv)->ExceptionClear(jenv);
-        return;
-    }
-    if (get == NULL || put == NULL || del == NULL)
+    jmethodID get = mss_method(jenv, cls, "getBridge", "([B)[B");
+    jmethodID put = get ? mss_method(jenv, cls, "putBridge", "([B[B)Z") : NULL;
+    jmethodID del = put ? mss_method(jenv, cls, "deleteBridge", "([B)Z") : NULL;
+    if (del == NULL)
         return;
 
+    /* The method IDs are set before g_cls, which is what callers check. */
     g_get = get;
     g_put = put;
     g_delete = del;
@@ -65,7 +75,13 @@ static ERL_NIF_TERM mss_jni_error(ErlNifEnv *env, const char *reason) {
     );
 }
 
-/* A new local byte[] holding bin, or NULL (exception cleared). */
+/* Java arrays are indexed by a signed 32-bit jsize. */
+static int mss_fits(ErlNifBinary *bin) {
+    return bin->size <= (size_t)INT32_MAX;
+}
+
+/* A new local byte[] holding bin (which mss_fits), or NULL (exception
+ * cleared). */
 static jbyteArray mss_bytes(JNIEnv *jenv, ErlNifBinary *bin) {
     jbyteArray arr = (*jenv)->NewByteArray(jenv, (jsize)bin->size);
     if (arr == NULL || (*jenv)->ExceptionCheck(jenv)) {
@@ -97,6 +113,8 @@ static ERL_NIF_TERM mss_get(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     ErlNifBinary key;
     if (!enif_inspect_binary(env, argv[0], &key))
         return enif_make_badarg(env);
+    if (!mss_fits(&key))
+        return mss_jni_error(env, "too_large");
     if (g_cls == NULL)
         return mss_jni_error(env, "bridge_not_registered");
 
@@ -154,6 +172,8 @@ static ERL_NIF_TERM mss_put(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
     ErlNifBinary key, val;
     if (!enif_inspect_binary(env, argv[0], &key) || !enif_inspect_binary(env, argv[1], &val))
         return enif_make_badarg(env);
+    if (!mss_fits(&key) || !mss_fits(&val))
+        return mss_jni_error(env, "too_large");
     if (g_cls == NULL)
         return mss_jni_error(env, "bridge_not_registered");
 
@@ -194,6 +214,8 @@ static ERL_NIF_TERM mss_delete(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
     ErlNifBinary key;
     if (!enif_inspect_binary(env, argv[0], &key))
         return enif_make_badarg(env);
+    if (!mss_fits(&key))
+        return mss_jni_error(env, "too_large");
     if (g_cls == NULL)
         return mss_jni_error(env, "bridge_not_registered");
 

@@ -19,11 +19,13 @@
  * Function surface (the stubs in src/mob_secure_store_nif.erl):
  *   available()          -> true
  *   store_get(Key)       -> {ok, Value} | not_found | {error, {sec, OSStatus}}
+ *                           | {error, no_data} (success without the data)
  *   store_put(Key, Val)  -> ok | {error, {sec, OSStatus}}
  *   store_delete(Key)    -> ok | {error, {sec, OSStatus}}   (absent key: ok)
  *
- * A key that isn't UTF-8 is badarg (MobSecureStore checks first). The store
- * calls are dirty IO NIFs: SecItem* is an IPC to securityd and may block.
+ * A failed CoreFoundation allocation is {error, {sec, errSecAllocate}}. A key
+ * that isn't UTF-8 is badarg (MobSecureStore checks first). The store calls
+ * are dirty IO NIFs: SecItem* is an IPC to securityd and may block.
  */
 
 #include <erl_nif.h>
@@ -32,7 +34,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Security.h>
 
-#define MSS_SERVICE "mob_secure_store"
+#define MSS_SERVICE CFSTR("mob_secure_store")
 
 /* The key as a CFString (UTF-8). NULL when the bytes aren't UTF-8. */
 static CFStringRef mss_account(ErlNifBinary *bin) {
@@ -41,22 +43,24 @@ static CFStringRef mss_account(ErlNifBinary *bin) {
     );
 }
 
-/* class + service + account: what identifies an item. kSecAttrAccessible is
- * deliberately not here; in a query it would become a match filter, so a
- * later change of the constant would orphan existing items. */
-static CFMutableDictionaryRef mss_base_query(CFStringRef account) {
-    CFStringRef service =
-        CFStringCreateWithCString(kCFAllocatorDefault, MSS_SERVICE, kCFStringEncodingUTF8);
-
-    CFMutableDictionaryRef query = CFDictionaryCreateMutable(
+static CFMutableDictionaryRef mss_dict(void) {
+    return CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks
     );
+}
+
+/* class + service + account: what identifies an item. kSecAttrAccessible is
+ * deliberately not here; in a query it would become a match filter, so a
+ * later change of the constant would orphan existing items. NULL when the
+ * allocation fails. */
+static CFMutableDictionaryRef mss_base_query(CFStringRef account) {
+    CFMutableDictionaryRef query = mss_dict();
+    if (!query)
+        return NULL;
 
     CFDictionarySetValue(query, kSecClass, kSecClassGenericPassword);
-    CFDictionarySetValue(query, kSecAttrService, service);
+    CFDictionarySetValue(query, kSecAttrService, MSS_SERVICE);
     CFDictionarySetValue(query, kSecAttrAccount, account);
-
-    CFRelease(service);
     return query;
 }
 
@@ -85,6 +89,10 @@ static ERL_NIF_TERM mss_get(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
         return enif_make_badarg(env);
 
     CFMutableDictionaryRef query = mss_base_query(account);
+    if (!query) {
+        CFRelease(account);
+        return mss_sec_error(env, errSecAllocate);
+    }
     CFDictionarySetValue(query, kSecReturnData, kCFBooleanTrue);
     CFDictionarySetValue(query, kSecMatchLimit, kSecMatchLimitOne);
 
@@ -95,11 +103,15 @@ static ERL_NIF_TERM mss_get(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     ERL_NIF_TERM result;
 
-    /* errSecSuccess with no data is treated as absent too, rather than as
-     * the self-contradictory {error, {sec, 0}}. */
-    if (st == errSecItemNotFound || (st == errSecSuccess && out == NULL)) {
+    if (st == errSecItemNotFound) {
         result = enif_make_atom(env, "not_found");
-    } else if (st == errSecSuccess) {
+    } else if (st != errSecSuccess) {
+        result = mss_sec_error(env, st);
+    } else if (out == NULL || CFGetTypeID(out) != CFDataGetTypeID()) {
+        /* Success that didn't return the data: a store failure, not an
+         * absent key. */
+        result = enif_make_tuple2(env, enif_make_atom(env, "error"), enif_make_atom(env, "no_data"));
+    } else {
         CFDataRef data = (CFDataRef)out;
         CFIndex len = CFDataGetLength(data);
         ErlNifBinary bin;
@@ -109,8 +121,6 @@ static ERL_NIF_TERM mss_get(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
             memcpy(bin.data, CFDataGetBytePtr(data), (size_t)len);
             result = enif_make_tuple2(env, enif_make_atom(env, "ok"), enif_make_binary(env, &bin));
         }
-    } else {
-        result = mss_sec_error(env, st);
     }
 
     if (out)
@@ -138,6 +148,11 @@ static ERL_NIF_TERM mss_put(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
      * writers both see not-found, both add, the second gets a duplicate.
      * kSecAttrAccessible goes on the add only (see mss_base_query). */
     CFMutableDictionaryRef add = mss_base_query(account);
+    if (!add) {
+        CFRelease(value);
+        CFRelease(account);
+        return mss_sec_error(env, errSecAllocate);
+    }
     CFDictionarySetValue(add, kSecValueData, value);
     CFDictionarySetValue(add, kSecAttrAccessible, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly);
 
@@ -146,15 +161,17 @@ static ERL_NIF_TERM mss_put(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
     if (st == errSecDuplicateItem) {
         CFMutableDictionaryRef match = mss_base_query(account);
-        CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(
-            kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks
-        );
-        CFDictionarySetValue(attrs, kSecValueData, value);
-
-        st = SecItemUpdate(match, attrs);
-
-        CFRelease(attrs);
-        CFRelease(match);
+        CFMutableDictionaryRef attrs = mss_dict();
+        if (match && attrs) {
+            CFDictionarySetValue(attrs, kSecValueData, value);
+            st = SecItemUpdate(match, attrs);
+        } else {
+            st = errSecAllocate;
+        }
+        if (attrs)
+            CFRelease(attrs);
+        if (match)
+            CFRelease(match);
     }
 
     CFRelease(value);
@@ -173,6 +190,10 @@ static ERL_NIF_TERM mss_delete(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
         return enif_make_badarg(env);
 
     CFMutableDictionaryRef query = mss_base_query(account);
+    if (!query) {
+        CFRelease(account);
+        return mss_sec_error(env, errSecAllocate);
+    }
     OSStatus st = SecItemDelete(query);
     CFRelease(query);
     CFRelease(account);

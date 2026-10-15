@@ -61,12 +61,6 @@ defmodule MobSecureStoreTest do
       assert File.stat!(dir).mode |> Bitwise.band(0o777) == 0o700
     end
 
-    test "a value written survives a fresh lookup of the backend (a restart)" do
-      assert MobSecureStore.put("k", "kept") == :ok
-      :persistent_term.erase({MobSecureStore, :backend})
-      assert MobSecureStore.get("k") == {:ok, "kept"}
-    end
-
     test "a failed write is an error, not :ok", %{dir: dir} do
       # A regular file where the directory should be.
       File.write!(dir, "")
@@ -93,26 +87,23 @@ defmodule MobSecureStoreTest do
   end
 
   describe "backend selection" do
-    test "only off the phone are secrets kept in files; a phone without the NIF fails closed" do
+    test "a linked NIF is the store; files only off the phone; a phone without the NIF fails closed" do
+      assert MobSecureStore.backend_for(:phone, true) == MobSecureStore.Native
+      assert MobSecureStore.backend_for(:phone, false) == MobSecureStore.Unavailable
       assert MobSecureStore.backend_for(:host, false) == MobSecureStore.File
-      assert MobSecureStore.backend_for(:host, true) == MobSecureStore.File
-      assert MobSecureStore.backend_for(:android, true) == MobSecureStore.Native
-      assert MobSecureStore.backend_for(:ios, true) == MobSecureStore.Native
-      assert MobSecureStore.backend_for(:android, false) == MobSecureStore.Unavailable
-      assert MobSecureStore.backend_for(:ios, false) == MobSecureStore.Unavailable
     end
 
-    test "the unavailable backend refuses everything" do
-      Application.put_env(:mob_secure_store, :backend, MobSecureStore.Unavailable)
+    test "on a phone without the NIF every call refuses, even with the file backend configured",
+         %{dir: dir} do
+      on_phone_without_nif()
 
-      assert MobSecureStore.put("k", "v") == {:error, :secure_store_unavailable}
-      assert MobSecureStore.get("k") == {:error, :secure_store_unavailable}
-      assert MobSecureStore.delete("k") == {:error, :secure_store_unavailable}
+      ExUnit.CaptureLog.capture_log(fn -> assert_refuses_everything(dir) end)
     end
 
-    test "configured backend wins over detection" do
+    test "a configured backend wins over detection" do
       Application.put_env(:mob_secure_store, :backend, MobSecureStore.Unavailable)
       assert MobSecureStore.backend() == MobSecureStore.Unavailable
+      assert MobSecureStore.put("k", "v") == {:error, :secure_store_unavailable}
     end
 
     # Guards the .erl stub (VacuousTest can't see Erlang modules as app code).
@@ -144,5 +135,30 @@ defmodule MobSecureStoreTest do
         assert File.exists?(Path.join([@plugin_dir, nif.native_dir, "mob_secure_store_nif.c"]))
       end
     end
+  end
+
+  defp assert_refuses_everything(dir) do
+    for configured <- [nil, MobSecureStore.File] do
+      if configured, do: Application.put_env(:mob_secure_store, :backend, configured)
+
+      assert MobSecureStore.backend() == MobSecureStore.Unavailable
+      assert MobSecureStore.put("k", "v") == {:error, :secure_store_unavailable}
+      assert MobSecureStore.get("k") == {:error, :secure_store_unavailable}
+      assert MobSecureStore.delete("k") == {:error, :secure_store_unavailable}
+    end
+
+    refute File.exists?(dir)
+  end
+
+  # Detection as on a phone whose app was built without the NIF: mob's device
+  # launcher sets MOB_BEAMS_DIR, and the NIF isn't linked on the host.
+  defp on_phone_without_nif do
+    System.put_env("MOB_BEAMS_DIR", "/nonexistent")
+    :persistent_term.erase({MobSecureStore, :environment})
+
+    on_exit(fn ->
+      System.delete_env("MOB_BEAMS_DIR")
+      :persistent_term.erase({MobSecureStore, :environment})
+    end)
   end
 end

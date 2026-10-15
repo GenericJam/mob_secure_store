@@ -27,9 +27,10 @@ a preferences entry.
 
 A store failure is never reported as an absent key: `:error` means "nothing
 there", `{:error, reason}` means "couldn't tell". Reasons are
-`{:sec, os_status}` (Security.framework on iOS), `{:jni, reason}` (Android:
-`:no_jenv`, `:bridge_not_registered`, `:alloc`, `:call_failed`,
-`:commit_failed`), `:secure_store_unavailable`, or a file error on the host.
+`{:sec, os_status}` or `:no_data` (Security.framework on iOS), `{:jni, reason}`
+(Android: `:no_jenv`, `:bridge_not_registered`, `:too_large`, `:alloc`,
+`:call_failed`, `:commit_failed`), `:secure_store_unavailable`, or a file
+error on the host.
 
 ## Where values live
 
@@ -43,10 +44,17 @@ there", `{:error, reason}` means "couldn't tell". Reasons are
 The store fails closed on a phone. If the plugin was activated after the app's
 last native build and only BEAMs were deployed, the NIF isn't in the app, and
 `MobSecureStore` refuses to store anything rather than write secrets to plain
-files. It logs an error once; `mix mob.deploy --native` fixes it.
+files. It logs an error once; `mix mob.deploy --native` fixes it. Anything that
+looks like a phone (mob's device launcher sets `MOB_BEAMS_DIR`, or mob core's
+NIF says `:android` / `:ios`) counts as one, so a broken mob core NIF can't
+make a phone fall back to files.
 
 `config :mob_secure_store, :backend, MyFake` replaces the backend (any module
-implementing the `MobSecureStore` behaviour), e.g. in a host app's tests.
+implementing the `MobSecureStore` behaviour), e.g. in a host app's tests. On a
+phone a configured `MobSecureStore.File` is refused (`Unavailable` instead).
+
+The host backend syncs each file before renaming it into place, but not the
+directory (Erlang can't), so it isn't power-cut durable; it's for development.
 
 ## Installing
 

@@ -2,8 +2,9 @@ name: tests
 
 # CI for the plugin's host-side Elixir surface — the same gate mob core runs,
 # so a PR gets a green check instead of relying only on each contributor's
-# local pre-push hook. The native code (C, Kotlin) is compiled by the host
-# app's native build, not here; `mix mob.selftest` proves it on a device.
+# local pre-push hook. The native jobs below only check that the C NIFs
+# compile; the host app's native build links them, and `mix mob.selftest`
+# proves them on a device.
 
 on:
   push:
@@ -56,3 +57,36 @@ jobs:
 
       - name: Tests
         run: mix test
+
+  # The C NIFs are compiled by the host app's native build, so nothing else in
+  # CI would notice one that no longer compiles. These check both against the
+  # real headers (the Kotlin bridge and the device behaviour are left to
+  # `mix mob.selftest` on a device).
+  native-android:
+    name: Android NIF compiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+      - name: clang -fsyntax-only (jni.h from the runner's JDK)
+        run: |
+          erl_inc="$(erl -noshell -eval 'io:format("~s/usr/include", [code:root_dir()]), halt().')"
+          clang -fsyntax-only -Wall -Wextra -Werror \
+            -I"$erl_inc" -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
+            priv/native/jni/mob_secure_store_nif.c
+
+  native-ios:
+    name: iOS NIF compiles
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Erlang (for erl_nif.h)
+        run: brew install erlang
+      - name: clang -fsyntax-only against the iOS simulator SDK
+        run: |
+          erl_inc="$(erl -noshell -eval 'io:format("~s/usr/include", [code:root_dir()]), halt().')"
+          xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator \
+            -fsyntax-only -Wall -Wextra -Werror -I"$erl_inc" \
+            priv/native/ios/mob_secure_store_nif.c

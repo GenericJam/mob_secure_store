@@ -20,7 +20,7 @@ You're in **mob_secure_store**, a Mob plugin that keeps small secrets in the pla
 
 ## Rules that matter here
 
-1. **Fail closed on a phone.** `backend_for/2` must never return `MobSecureStore.File` for `:android` or `:ios`. A phone without the NIF gets `Unavailable`. A misdetected platform that falls back to files would write secrets in plain text; detection goes through `:mob_nif.platform/0`, and anything that isn't `:android`/`:ios` is the host.
+1. **Fail closed on a phone.** `backend_for/2` must never return `MobSecureStore.File` for `:phone`, and `backend/0` refuses a configured `File` there too. A phone without the NIF gets `Unavailable`. Detection (`phone?/0`) errs towards "phone": `MOB_BEAMS_DIR` (set by mob's device launcher) or `:mob_nif.platform/0` answering `:android`/`:ios`. A linked NIF always means `Native`.
 2. **A store failure is not an absent key.** `get/1` returns `:error` only for "nothing stored". Every native failure is `{:error, _}`; the Kotlin bridge throws (→ `{:jni, :call_failed}`) when the store didn't open, rather than returning null.
 3. **Keychain attributes.** `kSecAttrAccessible` is set on add only, never in the match query (it would become a filter and orphan items if it ever changed). Upsert is add-then-update-on-duplicate, not the reverse (races).
 4. **Bytes across JNI, not strings.** Values are arbitrary binaries; the bridge Base64-encodes them for SharedPreferences. Don't reintroduce `NewStringUTF` (modified UTF-8, cuts at NUL).
